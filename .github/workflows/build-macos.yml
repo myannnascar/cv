@@ -1,0 +1,219 @@
+name: Build macOS
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_aarch64:
+        description: '构建 Apple M芯片 (aarch64)'
+        required: false
+        type: boolean
+        default: true
+      build_x64:
+        description: '构建 Intel芯片 (x86_64)'
+        required: false
+        type: boolean
+        default: true
+      upload_to_release:
+        description: '上传到 Release（否则仅存 Artifacts）'
+        required: false
+        type: boolean
+        default: false
+
+permissions: write-all
+env:
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: short
+  HUSKY: 0
+  TAG_NAME: macos-build
+
+concurrency:
+  group: '${{ github.workflow }} - ${{ github.head_ref || github.ref }}'
+  cancel-in-progress: true
+
+jobs:
+  prepare:
+    name: Prepare Release
+    runs-on: ubuntu-latest
+    if: inputs.upload_to_release == true
+    outputs:
+      release_id: ${{ steps.create_release.outputs.id }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Create Draft Release
+        id: create_release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: macos-build-${{ github.sha }}
+          target_commitish: ${{ github.sha }}
+          name: 'macOS Build ${{ github.sha }}'
+          body: 'Custom macOS build'
+          draft: true
+          prerelease: true
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  build:
+    name: Build macOS
+    needs: prepare
+    if: always()
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            arch_name: aarch64
+            friendly_name: 'Apple M芯片'
+            input_flag: build_aarch64
+          - target: x86_64-apple-darwin
+            arch_name: x64
+            friendly_name: 'Intel芯片'
+            input_flag: build_x64
+    runs-on: macos-latest
+    steps:
+      - name: Skip if not selected
+        if: github.event.inputs[matrix.input_flag] != 'true'
+        run: |
+          echo "Skipping ${{ matrix.friendly_name }} build"
+          echo "SKIPPED=true" >> $GITHUB_ENV
+
+      - name: Checkout
+        if: env.SKIPPED != 'true'
+        uses: actions/checkout@v7
+
+      - name: Install Rust
+        if: env.SKIPPED != 'true'
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.96.1'
+          targets: ${{ matrix.target }}
+
+      - name: Rust Cache
+        if: env.SKIPPED != 'true'
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: 'v1-rust-macos'
+          key: 'rust-macos-${{ matrix.target }}'
+          workspaces: |
+            . -> target
+          cache-all-crates: true
+          cache-workspace-crates: true
+
+      - name: Install Node.js
+        if: env.SKIPPED != 'true'
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24.18.0'
+
+      - name: Enable Corepack and install pnpm
+        if: env.SKIPPED != 'true'
+        run: |
+          corepack enable
+          corepack prepare --activate
+          pnpm --version
+
+      - name: Get pnpm store path
+        if: env.SKIPPED != 'true'
+        id: pnpm-cache
+        run: echo "STORE_PATH=$(pnpm store path)" >> $GITHUB_OUTPUT
+
+      - name: Setup pnpm cache
+        if: env.SKIPPED != 'true'
+        uses: actions/cache@v6
+        with:
+          path: ${{ steps.pnpm-cache.outputs.STORE_PATH }}
+          key: pnpm-macos-${{ matrix.target }}-${{ hashFiles('pnpm-lock.yaml') }}
+          restore-keys: |
+            pnpm-macos-${{ matrix.target }}-
+            pnpm-macos-
+
+      - name: Install dependencies & prebuild
+        if: env.SKIPPED != 'true'
+        run: |
+          pnpm i
+          pnpm run prebuild ${{ matrix.target }}
+
+      - name: Add Rust Target
+        if: env.SKIPPED != 'true'
+        run: |
+          rustup target add ${{ matrix.target }} --toolchain 1.96.1 || rustup target add ${{ matrix.target }}
+          rustup target list --installed
+
+      - name: Check Apple signing secrets availability
+        if: env.SKIPPED != 'true'
+        id: signing_check
+        run: |
+          if [ -n "${{ secrets.APPLE_CERTIFICATE }}" ] && [ -n "${{ secrets.APPLE_CERTIFICATE_PASSWORD }}" ] && [ -n "${{ secrets.APPLE_SIGNING_IDENTITY }}" ]; then
+            echo "has_apple_certs=true" >> $GITHUB_OUTPUT
+            echo "✅ Apple signing secrets found, will sign the bundle"
+          else
+            echo "has_apple_certs=false" >> $GITHUB_OUTPUT
+            echo "⚠️  Apple signing secrets NOT found, will skip code signing"
+          fi
+          if [ -n "${{ secrets.TAURI_PRIVATE_KEY }}" ] && [ -n "${{ secrets.TAURI_KEY_PASSWORD }}" ]; then
+            echo "has_tauri_key=true" >> $GITHUB_OUTPUT
+            echo "✅ Tauri updater key found"
+          else
+            echo "has_tauri_key=false" >> $GITHUB_OUTPUT
+            echo "⚠️  Tauri updater key NOT found"
+          fi
+
+      - name: Tauri Build (WITH signing)
+        if: env.SKIPPED != 'true' && steps.signing_check.outputs.has_apple_certs == 'true'
+        uses: tauri-apps/tauri-action@v1.0.0
+        env:
+          NODE_OPTIONS: '--max_old_space_size=4096'
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        with:
+          tauriScript: pnpm
+          args: --target ${{ matrix.target }} -b dmg
+          releaseId: ${{ needs.prepare.outputs.release_id }}
+          tagName: macos-build-${{ github.sha }}
+          releaseName: 'macOS Build ${{ github.sha }}'
+          releaseBody: 'Custom macOS build for ${{ matrix.friendly_name }} (${{ matrix.arch_name }})'
+          releaseDraft: true
+          prerelease: true
+
+      - name: Tauri Build (WITHOUT signing)
+        if: env.SKIPPED != 'true' && steps.signing_check.outputs.has_apple_certs != 'true'
+        env:
+          NODE_OPTIONS: '--max_old_space_size=4096'
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
+        run: |
+          BUILD_ARGS="--target ${{ matrix.target }} -b dmg"
+          # 如果没有 Apple 证书，就跳过签名 + 跳过 stapling(notarization)
+          BUILD_ARGS="$BUILD_ARGS --no-sign --skip-stapling"
+          pnpm build $BUILD_ARGS
+
+      - name: Upload to Release (if upload_to_release selected)
+        if: env.SKIPPED != 'true' && inputs.upload_to_release == true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          DMG_PATH=$(ls target/${{ matrix.target }}/release/bundle/dmg/*.dmg 2>/dev/null || true)
+          if [ -z "$DMG_PATH" ]; then
+            echo "❌ No .dmg file found"
+            ls -la target/${{ matrix.target }}/release/bundle/ 2>/dev/null || true
+            exit 1
+          fi
+          echo "✅ Found dmg: $DMG_PATH"
+          gh release upload "macos-build-${{ github.sha }}" "$DMG_PATH" --clobber
+
+      - name: Upload Artifact
+        if: env.SKIPPED != 'true' && inputs.upload_to_release != true
+        uses: actions/upload-artifact@v7
+        with:
+          name: clash-verge-macos-${{ matrix.arch_name }}
+          path: target/${{ matrix.target }}/release/bundle/dmg/*.dmg
+          if-no-files-found: error
+          retention-days: 30
